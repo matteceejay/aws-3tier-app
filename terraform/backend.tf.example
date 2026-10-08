@@ -1,0 +1,4 @@
+# Copy to backend.hcl and fill in your own values.
+# backend.hcl is gitignored.
+bucket = "<your-state-bucket-name>"
+region = "us-east-1"

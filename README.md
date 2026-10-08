@@ -107,3 +107,16 @@ Add HTTPS with ACM, Route 53, WAF, CloudWatch alarms, NAT per AZ, Multi-AZ RDS, 
 You should finish this project able to say, truthfully:
 
 > I built a three-tier AWS environment with Terraform. I designed the VPC and subnet routing, restricted traffic between the ALB, application and database tiers with security groups, deployed the application with an Auto Scaling Group, kept PostgreSQL private, used IAM/Systems Manager and Secrets Manager, configured remote Terraform state, and troubleshot failures such as unhealthy targets and database connectivity.
+
+
+
+
+
+
+
+
+
+
+#BOOTSTRAP DECISION
+
+Application bootstrap: The app code (app/app.py, app/requirements.txt) is embedded into EC2 user data with Terraform's templatefile() and file(). On boot, each instance installs Python 3.12, creates a virtualenv, installs dependencies, and runs the app with gunicorn as a systemd service on port 8000. This avoids an extra S3 bucket or Git access from private instances, and the app is small enough for the 16 KB user data limit. A code change creates a new launch template version, and the ASG's instance refresh rolls it out. Database settings (host, name, secret ARN) go into /etc/app.env. The password is never written to disk; the app reads it from Secrets Manager at runtime using its IAM role.

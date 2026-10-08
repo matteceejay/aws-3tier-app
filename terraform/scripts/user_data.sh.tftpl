@@ -1,0 +1,111 @@
+#!/bin/bash
+# ===============================================================
+# USER DATA: runs once, as root, the first time an instance boots.
+# Terraform fills in the placeholder values (like the DB host)
+# using templatefile() before the script is sent to the instance.
+#
+# NOTE: in a .tftpl file, a dollar sign followed by curly braces
+# belongs to Terraform, even inside comments. That's why bash
+# variables below are written WITHOUT braces. If you ever need
+# literal dollar-brace text in this file, write it with two
+# dollar signs ($$) so Terraform leaves it alone.
+# ===============================================================
+set -euxo pipefail
+exec > >(tee /var/log/user-data.log) 2>&1
+
+# ---------------------------------------------------------------
+# 1. Install Python
+# ---------------------------------------------------------------
+# AL2023's default python3 is 3.9, which newer boto3 releases are
+# dropping. Python 3.12 is available as a separate package.
+# This download goes out through the NAT Gateway on port 443.
+dnf install -y python3.12 python3.12-pip
+
+# ---------------------------------------------------------------
+# 2. Create a dedicated user and app folder
+# ---------------------------------------------------------------
+# Running the app as a non-root user limits the damage if the app
+# is ever compromised. --shell /sbin/nologin means nobody can log
+# in as this user.
+useradd --system --home-dir /opt/app --shell /sbin/nologin appuser || true
+mkdir -p /opt/app
+
+# ---------------------------------------------------------------
+# 3. Write the application files (embedded by Terraform)
+# ---------------------------------------------------------------
+# The quotes around 'APP_PY_EOF' tell bash to write the content
+# exactly as-is, without trying to expand anything inside it.
+cat > /opt/app/app.py <<'APP_PY_EOF'
+${app_py}
+APP_PY_EOF
+
+cat > /opt/app/requirements.txt <<'REQ_EOF'
+${requirements_txt}
+REQ_EOF
+
+# ---------------------------------------------------------------
+# 4. Install Python dependencies in a virtual environment
+# ---------------------------------------------------------------
+# A venv keeps the app's packages separate from the system Python,
+# so OS updates and app updates don't break each other.
+python3.12 -m venv /opt/app/venv
+/opt/app/venv/bin/pip install --upgrade pip
+/opt/app/venv/bin/pip install -r /opt/app/requirements.txt
+
+chown -R appuser:appuser /opt/app
+
+# ---------------------------------------------------------------
+# 5. App settings (NO password here)
+# ---------------------------------------------------------------
+# These match the environment variables app.py reads.
+# DB_SECRET_ARN is only the secret's address. The app uses its IAM
+# role to fetch the real password from Secrets Manager at runtime.
+cat > /etc/app.env <<EOF
+AWS_REGION=${aws_region}
+DB_HOST=${db_host}
+DB_NAME=${db_name}
+DB_SECRET_ARN=${db_secret_arn}
+EOF
+
+chown root:appuser /etc/app.env
+chmod 640 /etc/app.env # root can write, appuser can read, others nothing
+
+# ---------------------------------------------------------------
+# 6. Run the app as a systemd service
+# ---------------------------------------------------------------
+# systemd starts the app on boot and restarts it if it crashes.
+# gunicorn is a production web server for Flask (Flask's built-in
+# server is for development only). It listens on port 8000, which
+# is the port the ALB sends traffic to.
+cat > /etc/systemd/system/app.service <<'EOF'
+[Unit]
+Description=Flask application (gunicorn)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+User=appuser
+Group=appuser
+WorkingDirectory=/opt/app
+EnvironmentFile=/etc/app.env
+ExecStart=/opt/app/venv/bin/gunicorn --bind 0.0.0.0:8000 --workers 2 --access-logfile - app:app
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target
+EOF
+
+systemctl daemon-reload
+systemctl enable --now app
+
+# ---------------------------------------------------------------
+# 7. Lock down access
+# ---------------------------------------------------------------
+# We use Session Manager, not SSH, so turn sshd off completely.
+# The SSM agent comes pre-installed on AL2023. We just make sure
+# it's running.
+systemctl disable --now sshd
+systemctl enable --now amazon-ssm-agent
+
+echo "Bootstrap complete"
